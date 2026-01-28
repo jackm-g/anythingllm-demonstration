@@ -8,62 +8,20 @@ Pulls ThreatFox IOCs from the last day, creates an AnythingLLM workspace and thr
 
 ### I/O diagram
 
-Data flow between the orchestrator, local modules, and external services:
+Primary APIs, services, and relationships:
 
-```mermaid
-flowchart TB
-  subgraph input [Input]
-    CLI["CLI (--mission)"]
-    Env[".env (keys, workspace, USE_LLM_QUESTIONS, etc.)"]
-  end
-
-  subgraph orch [threatfox_daily_report.py]
-    Main[main]
-    BuildMD[build_markdown_report]
-    GenQ["generate_questions or _template_questions"]
-    Main --> BuildMD
-    Main --> GenQ
-  end
-
-  subgraph mod [Local module]
-    IOC[threatfox_ioc.get_recent_iocs]
-  end
-
-  subgraph ext [External services]
-    TFA[ThreatFox API]
-    ALM[AnythingLLM API]
-  end
-
-  subgraph out [Output]
-    Out["workspace and thread ready"]
-  end
-
-  CLI --> Main
-  Env --> Main
-  Main -->|"days"| IOC
-  IOC -->|"POST get_iocs"| TFA
-  TFA -->|"query_status, count, data"| IOC
-  IOC -->|"result"| Main
-  Main -->|"normalized"| BuildMD
-  BuildMD -->|"markdown"| Main
-  Main -->|"workspaces / workspace/new / thread/new"| ALM
-  ALM -->|"workspace_slug, thread_slug"| Main
-  Main -->|"document/upload (JSON + MD)"| ALM
-  Main -->|"mission"| GenQ
-  GenQ -->|"3 questions"| Main
-  Main -->|"openai/chat/completions if USE_LLM_QUESTIONS"| ALM
-  ALM -->|"3 questions"| GenQ
-  GenQ --> Main
-  Main -->|"stream-chat x4 (message)"| ALM
-  ALM -->|"streamed reply"| Main
-  Main -->|"stderr summary"| Out
 ```
-
-- **Input:** CLI args (`--mission`) and `.env` (ThreatFox key, AnythingLLM key, optional workspace/LLM/USE_LLM_QUESTIONS).
-- **threatfox_ioc:** `get_recent_iocs(days)` calls ThreatFox, returns `{query_status, count, data}`.
-- **threatfox_daily_report:** Builds markdown from that result; gets/creates workspace and thread; uploads JSON + report; gets 3 questions (AnythingLLM chat/completions or templates); runs 4 stream-chat turns.
-- **AnythingLLM:** Workspaces, thread, document upload, `/v1/openai/chat/completions` (question gen), thread stream-chat.
-- **Output:** Workspace and thread are ready in AnythingLLM; script logs a one-line summary to stderr.
+  threatfox_daily_report.py
+       |                    \
+       | get_recent_iocs     \  workspaces, thread/new, document/upload,
+       v                      \ openai/chat/completions, stream-chat
+  threatfox_ioc  --------->   AnythingLLM API
+       |                      (localhost:3001)
+       | get_iocs
+       v
+  ThreatFox API
+  (threatfox.abuse.ch)
+```
 
 ### Requirements
 
