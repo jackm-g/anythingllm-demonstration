@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
 ThreatFox daily report tool: pull IOCs from the last day, create an AnythingLLM
-workspace/thread, upload JSON + markdown report, and run a simulated 3-message
+workspace/thread, upload JSON + markdown report, and run a simulated 4-message
 analyst/LLM conversation so a human can review in AnythingLLM.
 
 Uses agents/threatfox_ioc.get_recent_iocs and AnythingLLM APIs (workspace, thread,
-document upload, stream-chat). Env: THREATFOX_AUTH_KEY, ANYTHINGLLM_API_KEY;
-optional ANYTHINGLLM_BASE_URL, ANYTHINGLLM_THREATFOX_WORKSPACE, USE_LLM_QUESTIONS,
-OPENAI_API_KEY. See .env.example.
+document upload, stream-chat, /v1/openai/chat/completions for LLM-generated
+questions). Env: THREATFOX_AUTH_KEY, ANYTHINGLLM_API_KEY; optional ANYTHINGLLM_BASE_URL,
+ANYTHINGLLM_THREATFOX_WORKSPACE, ANYTHINGLLM_LLM_MODEL, USE_LLM_QUESTIONS. See .env.example.
+
+Usage:
+  python agents/threatfox_daily_report.py [--mission "hunting cobalt strike instances"]
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -38,15 +42,39 @@ from threatfox_ioc import get_recent_iocs  # noqa: E402
 
 DEFAULT_BASE_URL = "http://localhost:3001"
 DEFAULT_THREATFOX_WORKSPACE = "ThreatFox Daily"
+# First 3 are mission-tailored (or generic); 4th is always the summary ask
 TEMPLATE_QUESTIONS = [
     "What are the most critical IOCs in this dataset and why?",
     "Which malware families appear most often and what should we prioritize for blocking?",
     "Summarize key recommendations for our SOC based on this ThreatFox pull.",
 ]
-QUESTION_GEN_PROMPT = (
-    "Using only the ThreatFox IOC data in this workspace, output exactly 3 concise "
-    "questions an expert security analyst would ask, one per line, numbered 1–3."
-)
+SUMMARY_QUESTION = "Summarize the key findings in no more than 3 bullet points."
+
+
+def _question_gen_prompt(mission: str | None) -> str:
+    base = (
+        "Using only the ThreatFox IOC data in this workspace, output exactly 3 concise "
+        "questions an expert security analyst would ask, one per line, numbered 1–3."
+    )
+    if mission and mission.strip():
+        return (
+            f"Mission for this analysis: {mission.strip()}\n\n"
+            f"{base} The questions must be tailored to that mission."
+        )
+    return base
+
+
+def _template_questions(mission: str | None) -> list[str]:
+    if not mission or not mission.strip():
+        return list(TEMPLATE_QUESTIONS)
+    m = mission.strip()
+    return [
+        f"What are the most critical IOCs in this dataset relevant to {m} and why?",
+        f"Which indicators or malware families here relate to {m}, and what should we prioritize for blocking?",
+        f"Summarize key recommendations for our SOC regarding {m} based on this ThreatFox pull.",
+    ]
+
+
 SAMPLE_IOC_ROWS = 15
 EMBED_WAIT_SECONDS = 5
 
@@ -138,11 +166,17 @@ def chat_stream(
     message: str,
     *,
     thread_slug: str,
+    model: str | None = None,
 ) -> str:
-    """Send a message to the thread via stream-chat and return full assistant text."""
+    """Send a message to the thread via stream-chat and return full assistant text.
+    If model is set (e.g. from ANYTHINGLLM_LLM_MODEL), it is sent so the instance
+    can use that LLM instead of the workspace default.
+    """
     url = f"{base_url.rstrip('/')}/api/v1/workspace/{workspace_slug}/thread/{thread_slug}/stream-chat"
     headers = {**_headers(api_key), "Content-Type": "application/json"}
-    body = {"message": message, "mode": "chat"}
+    body: dict = {"message": message, "mode": "chat"}
+    if model and model.strip():
+        body["model"] = model.strip()
     resp = requests.post(url, headers=headers, json=body, timeout=120, stream=True)
     resp.raise_for_status()
 
@@ -249,28 +283,13 @@ def upload_document(
     return resp.json()
 
 
-def generate_questions_via_anythingllm(
-    base_url: str,
-    api_key: str,
-    workspace_slug: str,
-    thread_slug: str,
-) -> list[str] | None:
-    """Ask AnythingLLM for 3 analyst questions; returns parsed list or None."""
-    try:
-        text = chat_stream(
-            base_url, api_key, workspace_slug, QUESTION_GEN_PROMPT, thread_slug=thread_slug
-        )
-    except requests.RequestException:
-        return None
-    if not text or not text.strip():
-        return None
-    # Parse "1. ..." or "1) ..." or first three non-empty lines
+def _parse_three_questions(text: str) -> list[str] | None:
+    """Parse '1. ...' / '1) ...' style lines into up to 3 question strings."""
     questions: list[str] = []
     for line in text.strip().splitlines():
         line = line.strip()
         if not line:
             continue
-        # Remove leading "1.", "1)", "1 -", etc.
         m = re.match(r"^\d+[.)\-\s]+\s*(.+)$", line, re.IGNORECASE)
         if m:
             questions.append(m.group(1).strip())
@@ -281,58 +300,58 @@ def generate_questions_via_anythingllm(
     return questions[:3] if len(questions) >= 3 else None
 
 
-def generate_questions_via_openai(result: dict) -> list[str] | None:
-    """Use OpenAI (or compatible) API to generate 3 analyst questions; returns list or None."""
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return None
-    count = result.get("count", 0) or len(result.get("data") or [])
-    data = result.get("data") or []
-    malware_counts: dict[str, int] = {}
-    for row in data[:100]:
-        mp = row.get("malware_printable") or row.get("malware") or "Unknown"
-        malware_counts[mp] = malware_counts.get(mp, 0) + 1
-    top = sorted(malware_counts.items(), key=lambda x: -x[1])[:5]
-    summary = f"ThreatFox pull: {count} IOCs. Top malware: " + ", ".join(
-        f"{n}({c})" for n, c in top
-    )
-    prompt = (
-        f"Context: {summary}. Output exactly 3 concise questions an expert security "
-        "analyst would ask about this data, one per line, numbered 1–3."
-    )
-    base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    url = f"{base}/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+def generate_questions_via_anythingllm_chat_completions(
+    base_url: str,
+    api_key: str,
+    workspace_slug: str,
+    *,
+    mission: str | None = None,
+) -> list[str] | None:
+    """Generate 3 analyst questions via AnythingLLM POST /api/v1/openai/chat/completions.
+    Uses the workspace's documents and AnythingLLM auth only (no OpenAI token).
+    Model is the workspace slug per the OpenAPI. Returns parsed list or None.
+    """
+    prompt = _question_gen_prompt(mission)
+    url = f"{base_url.rstrip('/')}/api/v1/openai/chat/completions"
+    headers = {**_headers(api_key), "Content-Type": "application/json"}
     body = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "model": workspace_slug,
         "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "temperature": 0.3,
         "max_tokens": 300,
     }
     try:
-        resp = requests.post(url, headers=headers, json=body, timeout=30)
+        resp = requests.post(url, headers=headers, json=body, timeout=120)
         resp.raise_for_status()
-        data_resp = resp.json()
-        content = (data_resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        data = resp.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
     except requests.RequestException:
         return None
-    if not content.strip():
+    if not content or not content.strip():
         return None
-    questions = []
-    for line in content.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(r"^\d+[.)\-\s]+\s*(.+)$", line, re.IGNORECASE)
-        if m:
-            questions.append(m.group(1).strip())
-        else:
-            questions.append(line)
-        if len(questions) >= 3:
-            return questions[:3]
-    return questions[:3] if len(questions) >= 3 else None
+    return _parse_three_questions(content)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="ThreatFox daily report: pull IOCs, create AnythingLLM thread, run analyst/LLM Q&A.",
+    )
+    p.add_argument(
+        "--mission",
+        type=str,
+        default=None,
+        metavar="TEXT",
+        help="Mission for the analysis (e.g. 'hunting cobalt strike instances'). "
+             "The 3 analyst questions are tailored to this mission.",
+    )
+    return p.parse_args()
 
 
 def main() -> None:
+    args = parse_args()
+    mission = (args.mission or "").strip() or None
+
     # 1. Env and validation
     project_root = PROJECT_ROOT
     if not project_root.joinpath(".env").exists():
@@ -350,6 +369,7 @@ def main() -> None:
         os.getenv("ANYTHINGLLM_THREATFOX_WORKSPACE", "").strip()
         or DEFAULT_THREATFOX_WORKSPACE
     )
+    llm_model = os.getenv("ANYTHINGLLM_LLM_MODEL", "").strip() or None
     use_llm_questions = os.getenv("USE_LLM_QUESTIONS", "").strip().lower() in ("1", "true", "yes")
 
     # 2. ThreatFox IOCs (last 1 day)
@@ -430,24 +450,26 @@ def main() -> None:
     if EMBED_WAIT_SECONDS > 0:
         time.sleep(EMBED_WAIT_SECONDS)
 
-    # 6. Analyst questions
+    # 6. Analyst questions: 3 mission-tailored + 1 summary (via AnythingLLM /v1/openai/chat/completions when USE_LLM_QUESTIONS)
     questions: list[str] = []
     if use_llm_questions:
-        q = generate_questions_via_anythingllm(base_url, api_key, ws_slug, thread_slug)
+        q = generate_questions_via_anythingllm_chat_completions(
+            base_url, api_key, ws_slug, mission=mission,
+        )
         if q and len(q) == 3:
             questions = q
-        if not questions:
-            q = generate_questions_via_openai(normalized)
-            if q and len(q) == 3:
-                questions = q
     if not questions:
-        questions = list(TEMPLATE_QUESTIONS)
+        questions = _template_questions(mission)
+    questions = questions[:3] + [SUMMARY_QUESTION]
 
-    # 7. Three stream-chat exchanges
+    # 7. Four stream-chat exchanges (3 tailored + 1 summary)
     for i, q in enumerate(questions, 1):
         try:
-            reply = chat_stream(base_url, api_key, ws_slug, q, thread_slug=thread_slug)
-            print(f"[{i}/3] Q: {q[:60]}... -> {len(reply)} chars", file=sys.stderr)
+            reply = chat_stream(
+                base_url, api_key, ws_slug, q,
+                thread_slug=thread_slug, model=llm_model,
+            )
+            print(f"[{i}/4] Q: {q[:60]}{'...' if len(q) > 60 else ''} -> {len(reply)} chars", file=sys.stderr)
         except requests.RequestException as e:
             print(f"Chat {i} failed: {e}", file=sys.stderr)
 
