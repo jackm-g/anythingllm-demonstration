@@ -34,6 +34,10 @@ flowchart TB
     ALM[AnythingLLM API]
   end
 
+  subgraph out [Output]
+    Out["workspace and thread ready"]
+  end
+
   CLI --> Main
   Env --> Main
   Main -->|"days"| IOC
@@ -52,7 +56,7 @@ flowchart TB
   GenQ --> Main
   Main -->|"stream-chat x4 (message)"| ALM
   ALM -->|"streamed reply"| Main
-  Main -->|"stderr: workspace, thread ready"| output [Output]
+  Main -->|"stderr summary"| Out
 ```
 
 - **Input:** CLI args (`--mission`) and `.env` (ThreatFox key, AnythingLLM key, optional workspace/LLM/USE_LLM_QUESTIONS).
